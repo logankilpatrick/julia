@@ -18,26 +18,17 @@ on `threadid()`.
 """
 nthreads() = Int(unsafe_load(cglobal(:jl_n_threads, Cint)))
 
-# Only read/written by the main thread
-const in_threaded_loop = Ref(false)
-
 function _threadsfor(iter,lbody)
     lidx = iter.args[1]         # index
     range = iter.args[2]
     quote
-        local threadsfor_fun
         let range = $(esc(range))
-        function threadsfor_fun(onethread=false)
+        function threadsfor_fun(tid)
             r = range # Load into local variable
             lenr = length(r)
-            # divide loop iterations among threads
-            if onethread
-                tid = 1
-                len, rem = lenr, 0
-            else
-                tid = threadid()
-                len, rem = divrem(lenr, nthreads())
-            end
+            # divide loop iterations among tasks
+            ngrains = min(nthreads(), lenr)
+            len, rem = divrem(lenr, ngrains)
             # not enough iterations for all the threads?
             if len == 0
                 if tid > rem
@@ -64,19 +55,23 @@ function _threadsfor(iter,lbody)
                 $(esc(lbody))
             end
         end
-        end
-        # Hack to make nested threaded loops kinda work
-        if threadid() != 1 || in_threaded_loop[]
-            # We are in a nested threaded loop
-            Base.invokelatest(threadsfor_fun, true)
-        else
-            in_threaded_loop[] = true
-            # the ccall is not expected to throw
-            ccall(:jl_threading_run, Cvoid, (Any,), threadsfor_fun)
-            in_threaded_loop[] = false
+        threading_run(threadsfor_fun, length(range))
         end
         nothing
     end
+end
+
+function threading_run(func, len)
+    ngrains = min(nthreads(), len)
+    tasks = Vector{Task}(undef, ngrains)
+    for tid = 1:ngrains
+        t = Task(()->func(tid))
+        t.sticky = false
+        tasks[tid] = t
+        schedule(t)
+    end
+    Base.sync_end(tasks)
+    return nothing
 end
 
 """
