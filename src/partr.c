@@ -27,6 +27,30 @@ static const int16_t not_sleeping = 0;
 // to see if it is safe to transition to sleeping.
 static const int16_t sleeping = 1;
 
+// invariant: No thread is ever asleep unless sleep_check_state is sleeping (or we have a wakeup signal pending).
+// invariant: Any particular thread is not asleep unless that thread's sleep_check_state is sleeping.
+// invariant: The transition of a thread state to sleeping must be followed by a check that there wasn't work pending for it.
+// information: Observing thread not-sleeping is sufficient to ensure the target thread will subsequently inspect its local queue.
+// information: Observing global not-sleeping is NOT sufficient to ensure the target thread will subsequently inspect its local queue.
+// information: Observing thread is-sleeping says it may be necessary to notify it at least once to wakeup. It may already be awake however for a variety of reasons.
+// information: When we transition global state from sleeping to not_sleeping, we also transition the local to not_sleeping to reduce repeat wakeup attempts.
+
+JULIA_DEBUG_SLEEPWAKE(
+uint64_t wakeup_enter;
+uint64_t wakeup_leave;
+uint64_t io_wakeup_enter;
+uint64_t io_wakeup_leave;
+);
+
+
+JL_DLLEXPORT void jl_set_task_tid(jl_task_t *task, int tid) JL_NOTSAFEPOINT
+{
+    // Try to acquire the lock on this task.
+    // If this fails, we'll check for that error later (in jl_switchto).
+    if (jl_atomic_load_acquire(&task->tid) != tid) {
+        jl_atomic_compare_exchange(&task->tid, -1, tid);
+    }
+}
 
 #ifdef JULIA_ENABLE_THREADING
 
@@ -162,11 +186,10 @@ static inline jl_task_t *multiq_deletemin(void)
         return NULL;
 
     task = heaps[rn1].tasks[0];
+    jl_set_task_tid(task, ptls->tid);
     if (jl_atomic_load_acquire(&task->tid) != ptls->tid) {
-        if (jl_atomic_compare_exchange(&task->tid, -1, ptls->tid) != -1) {
-            jl_mutex_unlock_nogc(&heaps[rn1].lock);
-            goto retry;
-        }
+        jl_mutex_unlock_nogc(&heaps[rn1].lock);
+        goto retry;
     }
     heaps[rn1].tasks[0] = heaps[rn1].tasks[--heaps[rn1].ntasks];
     heaps[rn1].tasks[heaps[rn1].ntasks] = NULL;
@@ -300,6 +323,7 @@ JL_DLLEXPORT int jl_enqueue_task(jl_task_t *task)
 //  sleep_check_after_threshold() -- if sleep_threshold ns have passed, return 1
 static int sleep_check_after_threshold(uint64_t *start_cycles)
 {
+    JULIA_DEBUG_SLEEPWAKE( return 1 ); // hammer on the sleep/wake logic much harder
     if (!(*start_cycles)) {
         *start_cycles = jl_hrtime();
         return 0;
@@ -316,11 +340,13 @@ static int sleep_check_after_threshold(uint64_t *start_cycles)
 static void wake_thread(int16_t tid)
 {
     jl_ptls_t other = jl_all_tls_states[tid];
-    int16_t state = jl_atomic_exchange(&other->sleep_check_state, not_sleeping);
-    if (state == sleeping) {
-        uv_mutex_lock(&other->sleep_lock);
-        uv_cond_signal(&other->wake_signal);
-        uv_mutex_unlock(&other->sleep_lock);
+    if (jl_atomic_load(&other->sleep_check_state) != not_sleeping) {
+        int16_t state = jl_atomic_exchange(&other->sleep_check_state, not_sleeping); // prohibit it from sleeping
+        if (state == sleeping) { // see if it was possibly sleeping before now
+            uv_mutex_lock(&other->sleep_lock);
+            uv_cond_signal(&other->wake_signal);
+            uv_mutex_unlock(&other->sleep_lock);
+        }
     }
 }
 
@@ -340,16 +366,25 @@ static int sleep_check_after_threshold(uint64_t *start_cycles)
 
 #endif
 
+static void wake_libuv(void)
+{
+    JULIA_DEBUG_SLEEPWAKE( io_wakeup_enter = rdtscp() );
+    jl_wake_libuv();
+    JULIA_DEBUG_SLEEPWAKE( io_wakeup_leave = rdtscp() );
+}
+
 /* ensure thread tid is awake if necessary */
 JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
+    int16_t uvlock = jl_atomic_load(&jl_uv_mutex.owner);
     int16_t self = ptls->tid;
     unsigned long system_self = jl_all_tls_states[self]->system_id;
-    int16_t uvlock = jl_atomic_load_acquire(&jl_uv_mutex.owner);
+    JULIA_DEBUG_SLEEPWAKE( wakeup_enter = rdtscp() );
     if (tid == self || tid == -1) {
         // we're already awake, but make sure we'll exit uv_run
-        jl_atomic_store(&ptls->sleep_check_state, not_sleeping);
+        if (jl_atomic_load(&ptls->sleep_check_state) != not_sleeping)
+            jl_atomic_store(&ptls->sleep_check_state, not_sleeping);
         if (uvlock == system_self)
             uv_stop(jl_global_event_loop());
     }
@@ -358,38 +393,31 @@ JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
         // something added to the sticky-queue: notify that thread
         wake_thread(tid);
         // check if we need to notify uv_run too
-        if (uvlock != system_self)
-            jl_wake_libuv();
+        /*unsigned long system_tid = jl_all_tls_states[tid]->system_id;*/
+        if (uvlock != system_self /*TODO: && jl_atomic_load(&jl_uv_mutex.owner) == system_tid*/)
+            wake_libuv();
     }
+    // check if the other threads might be sleeping
     if (tid == -1) {
-        // check if the other threads might be sleeping
-        if (jl_atomic_load_acquire(&sleep_check_state) != not_sleeping) {
-            // something added to the multi-queue: notify all threads
-            // in the future, we might want to instead wake some fraction of threads,
-            // and let each of those wake additional threads if they find work
+        // something added to the multi-queue: notify all threads
+        // in the future, we might want to instead wake some fraction of threads,
+        // and let each of those wake additional threads if they find work
+        if (jl_atomic_load(&sleep_check_state) != not_sleeping) {
             int16_t state = jl_atomic_exchange(&sleep_check_state, not_sleeping);
             if (state == sleeping) {
                 for (tid = 0; tid < jl_n_threads; tid++)
                     if (tid != self)
                         wake_thread(tid);
                 // check if we need to notify uv_run too
-                if (uvlock != system_self)
-                    jl_wake_libuv();
+                if (uvlock != system_self /*TODO: && jl_atomic_load(&jl_uv_mutex.owner) != 0*/)
+                    wake_libuv();
             }
         }
     }
 #endif
+    JULIA_DEBUG_SLEEPWAKE( wakeup_leave = rdtscp() );
 }
 
-
-JL_DLLEXPORT void jl_set_task_tid(jl_task_t *task, int tid) JL_NOTSAFEPOINT
-{
-    // Try to acquire the lock on this task.
-    // If this fails, we'll check for that error later (in jl_switchto).
-    if (jl_atomic_load_acquire(&task->tid) != tid) {
-        jl_atomic_compare_exchange(&task->tid, -1, tid);
-    }
-}
 
 // get the next runnable task from the multiq
 static jl_task_t *get_next_task(jl_value_t *getsticky)
@@ -442,8 +470,12 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
                 continue;
             jl_atomic_store(&ptls->sleep_check_state, sleeping); // acquire sleep-check lock
             task = get_next_task(getsticky);
-            if (task)
+            if (task) {
+                if (jl_atomic_load(&ptls->sleep_check_state) != not_sleeping)
+                    jl_atomic_store(&ptls->sleep_check_state, not_sleeping); // let other threads know they don't need to wake us
                 return task;
+            }
+
             // one thread should win this race and watch the event loop
             // inside a threaded region, any thread can listen for IO messages,
             // although none are allowed to create new ones
@@ -470,11 +502,15 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
                     jl_gc_safepoint();
                     if (may_sleep(ptls)) {
                         loop->stop_flag = 0;
+                        JULIA_DEBUG_SLEEPWAKE( ptls->uv_run_enter = rdtscp() );
                         active = uv_run(loop, UV_RUN_ONCE);
+                        JULIA_DEBUG_SLEEPWAKE( ptls->uv_run_leave = rdtscp() );
                     }
                     JL_UV_UNLOCK();
                     // optimization: check again first if we may have work to do
                     if (!may_sleep(ptls)) {
+                        if (jl_atomic_load(&ptls->sleep_check_state) != not_sleeping)
+                            jl_atomic_store(&ptls->sleep_check_state, not_sleeping); // let other threads know they don't need to wake us
                         start_cycles = 0;
                         continue;
                     }
@@ -489,18 +525,25 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *getsticky)
                 if (!_threadedregion && active && ptls->tid == 0) {
                     // thread 0 is the only thread permitted to run the event loop
                     // so it needs to stay alive
+                    if (jl_atomic_load(&ptls->sleep_check_state) != not_sleeping)
+                        jl_atomic_store(&ptls->sleep_check_state, not_sleeping); // let other threads know they don't need to wake us
                     start_cycles = 0;
                     continue;
                 }
             }
 
             // the other threads will just wait for on signal to resume
+            JULIA_DEBUG_SLEEPWAKE( ptls->sleep_enter = rdtscp() );
             int8_t gc_state = jl_gc_safe_enter(ptls);
             uv_mutex_lock(&ptls->sleep_lock);
             while (may_sleep(ptls)) {
                 uv_cond_wait(&ptls->wake_signal, &ptls->sleep_lock);
+                // TODO: help with gc work here, if applicable
             }
+            if (jl_atomic_load(&ptls->sleep_check_state) != not_sleeping)
+                jl_atomic_store(&ptls->sleep_check_state, not_sleeping); // let other threads know they don't need to wake us
             uv_mutex_unlock(&ptls->sleep_lock);
+            JULIA_DEBUG_SLEEPWAKE( ptls->sleep_leave = rdtscp() );
             jl_gc_safe_leave(ptls, gc_state); // contains jl_gc_safepoint
             start_cycles = 0;
         }

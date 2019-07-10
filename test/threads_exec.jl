@@ -4,6 +4,14 @@ using Test
 using Base.Threads
 using Base.Threads: SpinLock, Mutex
 
+Timer(1200) do t
+    # set up a watchdog alarm for 20 minutes
+    # so that we can attempt to get a "friendly" backtrace if something gets stuck
+    # (expected test duration is about 30 seconds)
+    ccall(:uv_kill, Cint, (Cint, Cint), getpid(), Base.SIGTERM)
+end
+
+
 # threading constructs
 
 let a = zeros(Int, 2 * nthreads())
