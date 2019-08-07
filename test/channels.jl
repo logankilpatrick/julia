@@ -323,12 +323,12 @@ end
     ct = current_task()
     testerr = ErrorException("expected")
     @async Base.throwto(t, testerr)
-    @test try
+    @test (try
         Base.wait(t)
         false
     catch ex
         ex
-    end === testerr
+    end).task.exception === testerr
 end
 
 @testset "Timer / AsyncCondition triggering and race #12719" begin
