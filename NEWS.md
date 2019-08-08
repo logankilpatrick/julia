@@ -33,6 +33,7 @@ New library functions
 * New `findall(pattern, string)` method where `pattern` is a string or regex ([#31834]).
 * `istaskfailed` is now documented and exported, like its siblings `istaskdone` and `istaskstarted` ([#32300]).
 * `RefArray` and `RefValue` objects now accept index `CartesianIndex()` in  `getindex` and `setindex!` ([#32653])
+* `rmrf` has been added as a shorthand for `rm(x, force=true, recursive=true)` ([#32831]).
 
 Standard library changes
 ------------------------
